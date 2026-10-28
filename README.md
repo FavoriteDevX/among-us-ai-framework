@@ -11,11 +11,40 @@ A multi-agent framework in which LLM-driven agents play Among Us on The Skeld: p
 | `among_us_ai/llm_bridge.py` | Claude (Messages API), GPT (Chat Completions) and Gemini (`generateContent`) providers; a thread-safe bridge with hot swapping, fallback chain, retry/backoff and JSON repair; reasoning templates for free-roam decisions, meeting statements, claim extraction and votes. |
 | `among_us_ai/discussion_engine.py` | Log-odds suspicion calibrated to the number of living impostors; kill-window travel-time alibis; claim extraction and auditing; the impostor deception planner (cover stories, scapegoats, strategy selection); a guarded voting policy; round-robin multi-agent meetings. |
 | `among_us_ai/controller.py` | Input backends (pyautogui/mss, or a recording backend for dry runs), screen calibration, closed-loop movement with stuck detection and replanning, vent hops, kill/report/sabotage, pixel-based solvers for the task minigames, chat and voting. |
+| `among_us_ai/simulator.py` | Headless Skeld engine: per-player snapshots that respect vision, walls, lights and private knowledge; kills, bodies, reports, meetings, voting and ejections; vents; door, lights, comms, O2 and two-person reactor sabotages; multi-step tasks; win conditions; a runner that plays every seat with an agent. |
 | `among_us_ai/agent.py` | The perceive → decide → act loop for one player, with a rule-based planner that can defer to an LLM. |
 
 ## Perception input
 
 The framework does not read game memory. It consumes JSON snapshots (see `tests/conftest.py::make_snapshot` for the schema) produced by a client-side telemetry mod, a simulator, or a vision pipeline. `HttpSnapshotSource` polls an HTTP endpoint that serves them.
+
+## Headless simulator
+
+Agents run unchanged against the simulator: `SimController` implements the same `execute(action)` contract as the screen controller, and each player receives a snapshot with only the information that player would have.
+
+```bash
+python -m among_us_ai.simulator --seed 1
+```
+
+```bash
+python -m among_us_ai.simulator --games 30 --players 8 --impostors 2 --seed 100
+```
+
+```bash
+python -m among_us_ai.simulator --games 5 --llm claude
+```
+
+The first command prints one game's event log. The second runs a batch and prints win rates, end reasons and ejection accuracy. With `--llm`, meeting statements, claim extraction and votes go through the chosen provider. Without it, agents use the deterministic rule-based policy (about 5 to 6 seconds per 8-player game).
+
+```python
+from among_us_ai import SimConfig, play_game, run_series
+from among_us_ai.game_state import GameSettings
+
+result, log = play_game(SimConfig(num_players=8, settings=GameSettings(num_impostors=2), seed=7))
+print(result.winner, result.reason, result.correct_ejections, result.wrong_ejections)
+```
+
+The simulator models game rules, not animation timing or exact Skeld geometry. Task durations, sabotage timers and vision come from `SimConfig` and `GameSettings`.
 
 ## Calibration
 

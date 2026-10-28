@@ -19,13 +19,13 @@ import httpx
 
 from .controller import (
     Action,
+    ActionExecutor,
     ActionResult,
     CallEmergency,
     Chat,
     DoTask,
     FakeTask,
     FixSabotage,
-    GameController,
     Kill,
     MoveTo,
     Report,
@@ -96,6 +96,7 @@ class TaskPhasePlanner:
         self.bridge = bridge
         self.config = config or PlannerConfig()
         self._failed_tasks: dict[str, float] = {}
+        self._recent_fakes: dict[str, float] = {}
         self._last_kill_at: float | None = None
 
     def mark_task_failed(self, task_id: str, now: float) -> None:
@@ -106,7 +107,7 @@ class TaskPhasePlanner:
 
     def _distance(self, state: GameState, target: Any) -> float:
         try:
-            return self.pathfinder.find_path(state.me.position, target, closed_doors=state.closed_doors).distance
+            return self.pathfinder.static_distance(state.me.position, target)
         except NoPathError:
             return math.inf
 
@@ -126,7 +127,7 @@ class TaskPhasePlanner:
         if decisive and state.emergency_meetings_left > 0:
             options.append(Option("call_emergency", CallEmergency(), 90.0))
         if state.sabotage is not None and state.sabotage.fix_positions:
-            nearest = min(state.sabotage.fix_positions, key=lambda p: me.position.distance_to(p))
+            nearest = self._fix_panel(state)
             distance = self._distance(state, nearest)
             if state.sabotage.kind.is_critical:
                 options.append(Option("fix_sabotage", FixSabotage(nearest), 80.0, state.sabotage.kind.value))
@@ -197,12 +198,38 @@ class TaskPhasePlanner:
         if isolated is not None and state.kill_cooldown < 8.0:
             options.append(Option("hunt", MoveTo(isolated.position), 50.0 - state.kill_cooldown, isolated.name))
         for task in state.tasks:
+            faked_at = self._recent_fakes.get(task.task_id)
+            if faked_at is not None and state.timestamp - faked_at < 45.0:
+                continue
             distance = self._distance(state, task.position)
             if math.isfinite(distance):
                 options.append(Option("fake_task", FakeTask(task.task_id, duration=5.0), 20.0 - distance * 0.2, task.task_id))
         if not options:
             options.append(Option("wait", Wait(1.0), 0.0))
         return options
+
+    def _fix_panel(self, state: GameState, occupied_radius: float = 2.0) -> Any:
+        """Pick a sabotage panel, spreading crewmates across panels.
+
+        Reactor needs both panels held at once, so crewmates must split up.
+        A panel already occupied by a visible player is avoided; when several
+        players share a panel, the lowest player id stays and the rest move on.
+        """
+        assert state.sabotage is not None
+        me = state.me
+        panels = list(state.sabotage.fix_positions)
+        others = state.visible_others()
+
+        def occupants(panel: Any) -> list[PlayerState]:
+            return [p for p in others if p.position.distance_to(panel) <= occupied_radius]
+
+        here = next((p for p in panels if me.position.distance_to(p) <= occupied_radius), None)
+        if here is not None:
+            sharing = occupants(here)
+            if len(panels) == 1 or all(state.local_player_id < p.player_id for p in sharing):
+                return here
+        candidates = [p for p in panels if p is not here] or panels
+        return min(candidates, key=lambda p: (len(occupants(p)), self._distance(state, p)))
 
     def _safest_room(self, state: GameState, threat: PlayerState) -> Any:
         def score(room: Any) -> float:
@@ -229,6 +256,12 @@ class TaskPhasePlanner:
     # -- choice ------------------------------------------------------------- #
 
     def decide(self, state: GameState, tracker: GameStateTracker, discussion: DiscussionAgent) -> Option:
+        option = self._choose(state, tracker, discussion)
+        if isinstance(option.action, FakeTask):
+            self._recent_fakes[option.action.task_id] = state.timestamp
+        return option
+
+    def _choose(self, state: GameState, tracker: GameStateTracker, discussion: DiscussionAgent) -> Option:
         options = self.impostor_options(state, discussion) if state.is_impostor else self.crewmate_options(state, discussion)
         options.sort(key=lambda o: o.score, reverse=True)
         best = options[0]
@@ -281,7 +314,7 @@ class AmongUsAgent:
     def __init__(
         self,
         source: SnapshotSource,
-        controller_factory: Callable[[Callable[[], GameState]], GameController],
+        controller_factory: Callable[[Callable[[], GameState]], ActionExecutor],
         *,
         bridge: LLMBridge | None = None,
         pathfinder: Pathfinder | None = None,
@@ -321,7 +354,11 @@ class AmongUsAgent:
     # -- loop --------------------------------------------------------------- #
 
     def step(self) -> ActionResult | None:
-        state = self.refresh()
+        """Refresh perception, then decide and act once."""
+        return self.act(self.refresh())
+
+    def act(self, state: GameState) -> ActionResult | None:
+        """Decide and act on an already observed state."""
         assert self.discussion is not None
         if state.phase is GamePhase.TASKS:
             self._meeting_key = None

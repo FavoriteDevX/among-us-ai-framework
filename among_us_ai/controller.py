@@ -443,6 +443,12 @@ class ActionResult:
     duration: float
 
 
+class ActionExecutor(Protocol):
+    """Anything that can carry out an :data:`Action` (screen controller or simulator)."""
+
+    def execute(self, action: Action) -> ActionResult: ...
+
+
 # --------------------------------------------------------------------------- #
 # Minigame automation
 # --------------------------------------------------------------------------- #

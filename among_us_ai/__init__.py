@@ -6,9 +6,14 @@ from .discussion_engine import DiscussionAgent, MeetingSession, SuspicionModel
 from .game_state import GameState, GameStateParser, GameStateTracker, Role, Room, Vec2
 from .llm_bridge import AnthropicProvider, GeminiProvider, LLMBridge, OpenAIProvider, ScriptedProvider
 from .pathfinding import SKELD, NavGrid, Pathfinder
+from .simulator import SimConfig, SimController, SimulationRunner, SkeldSimulator, play_game, run_series
 
 __all__ = [
     "SKELD",
+    "SimConfig",
+    "SimController",
+    "SimulationRunner",
+    "SkeldSimulator",
     "AgentConfig",
     "AmongUsAgent",
     "AnthropicProvider",
@@ -35,6 +40,8 @@ __all__ = [
     "SuspicionModel",
     "TaskPhasePlanner",
     "Vec2",
+    "play_game",
+    "run_series",
 ]
 
 __version__ = "0.1.0"

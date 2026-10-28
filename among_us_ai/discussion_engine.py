@@ -429,6 +429,7 @@ class Claim:
     meeting_index: int
     target_id: int | None = None
     room: Room | None = None
+    eyewitness: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -463,6 +464,7 @@ _ACCUSE_RE: Final[re.Pattern[str]] = re.compile(
     r"\b(?:vote|it'?s|its|sus(?:sy)?|kill(?:ed|er)?|vented|impostor|imposter)\b", re.IGNORECASE
 )
 _VOUCH_RE: Final[re.Pattern[str]] = re.compile(r"\b(?:safe|clear(?:ed)?|innocent|trust|with me|vouch|not)\b", re.IGNORECASE)
+_EYEWITNESS_RE: Final[re.Pattern[str]] = re.compile(r"\b(?:saw|watched|seen)\b[^.!?]*\b(?:kill|killed|killing|vent|vented|venting)\b", re.IGNORECASE)
 _SELF_LOC_RE: Final[re.Pattern[str]] = re.compile(r"\bi\s*(?:was|am|'m|went)\b[^.!?]*", re.IGNORECASE)
 
 
@@ -508,7 +510,8 @@ def parse_claims_heuristically(statement: Statement, state: GameState, meeting_i
         window = re.search(rf"(?:.{{0,30}})(?:{pattern})(?:.{{0,30}})", text, re.IGNORECASE)
         context = window.group(0) if window else text
         if statement.accuse_id == pid or (statement.accuse_id is None and _ACCUSE_RE.search(context) and not _VOUCH_RE.search(context)):
-            claims.append(Claim(statement.speaker_id, ClaimKind.ACCUSE, statement.timestamp, meeting_index, target_id=pid))
+            claims.append(Claim(statement.speaker_id, ClaimKind.ACCUSE, statement.timestamp, meeting_index, target_id=pid,
+                                eyewitness=bool(_EYEWITNESS_RE.search(context))))
         elif statement.vouch_id == pid or _VOUCH_RE.search(context):
             claims.append(Claim(statement.speaker_id, ClaimKind.VOUCH, statement.timestamp, meeting_index, target_id=pid))
         saw = re.search(rf"saw\s+(?:{pattern})\s+(?:in|at|near|by)\s+([a-z0-9 ]+)", text, re.IGNORECASE)
@@ -522,8 +525,18 @@ def parse_claims_heuristically(statement: Statement, state: GameState, meeting_i
 class ClaimLedger:
     """Stores all claims and audits them against first-hand observations."""
 
-    def __init__(self, model: SuspicionModel, *, bridge: LLMBridge | None = None, adjacency_tolerance: float = 4.0) -> None:
+    def __init__(
+        self,
+        model: SuspicionModel,
+        *,
+        bridge: LLMBridge | None = None,
+        adjacency_tolerance: float = 4.0,
+        spawn_grace: float = 10.0,
+        eyewitness_scale: float = 3.0,
+    ) -> None:
         self.model = model
+        self.spawn_grace = spawn_grace
+        self.eyewitness_scale = eyewitness_scale
         self.bridge = bridge
         self.adjacency_tolerance = adjacency_tolerance
         self.claims: list[Claim] = []
@@ -561,7 +574,9 @@ class ClaimLedger:
             for name in data.get(key) or []:
                 target = state.player_by_name(str(name))
                 if target is not None and target.player_id != statement.speaker_id:
-                    claims.append(Claim(statement.speaker_id, kind, statement.timestamp, self.meeting_index, target_id=target.player_id))
+                    eyewitness = kind is ClaimKind.ACCUSE and bool(_EYEWITNESS_RE.search(statement.text))
+                    claims.append(Claim(statement.speaker_id, kind, statement.timestamp, self.meeting_index,
+                                        target_id=target.player_id, eyewitness=eyewitness))
         for item in data.get("saw") or []:
             if not isinstance(item, Mapping):
                 continue
@@ -587,11 +602,13 @@ class ClaimLedger:
         names = {pid: p.name for pid, p in state.players.items()}
         w = self.model.weight_for
         end = state.timestamp
+        # Everyone starts the round together at the spawn point; those sightings say nothing about later claims.
+        observed_from = round_start + self.spawn_grace
         probs = self.model.probabilities(state)
         for claim in claims:
             speaker = names.get(claim.speaker_id, "?")
             if claim.kind is ClaimKind.LOCATION and claim.room is not None:
-                seen = self._rooms_seen(tracker, claim.speaker_id, round_start, end)
+                seen = self._rooms_seen(tracker, claim.speaker_id, observed_from, end)
                 earlier = [c for c in self.claims_by(claim.speaker_id, ClaimKind.LOCATION) if c.meeting_index == claim.meeting_index and c.room is not claim.room and c is not claim]
                 if seen and claim.room not in seen:
                     found.append(Evidence(claim.speaker_id, EvidenceKind.CLAIM_CONTRADICTED, w(EvidenceKind.CLAIM_CONTRADICTED), claim.timestamp,
@@ -606,13 +623,13 @@ class ClaimLedger:
                                           f"{speaker} changed their story from {earlier[-1].room.value if earlier[-1].room else '?'} to {claim.room.value}",
                                           f"locchg:{claim.meeting_index}:{claim.speaker_id}"))
             elif claim.kind is ClaimKind.SIGHTING and claim.target_id is not None and claim.room is not None:
-                seen = self._rooms_seen(tracker, claim.target_id, round_start, end)
+                seen = self._rooms_seen(tracker, claim.target_id, observed_from, end)
                 if seen and claim.room not in seen and claim.target_id != self.model.owner_id:
                     found.append(Evidence(claim.speaker_id, EvidenceKind.CLAIM_CONTRADICTED, w(EvidenceKind.CLAIM_CONTRADICTED, 0.6), claim.timestamp,
                                           f"{speaker} placed {names.get(claim.target_id)} in {claim.room.value}, which contradicts what I saw",
                                           f"sightx:{claim.meeting_index}:{claim.speaker_id}:{claim.target_id}"))
                 elif claim.target_id == self.model.owner_id:
-                    my_rooms = self._rooms_seen(tracker, self.model.owner_id, round_start, end)
+                    my_rooms = self._rooms_seen(tracker, self.model.owner_id, observed_from, end)
                     if my_rooms and claim.room not in my_rooms:
                         found.append(Evidence(claim.speaker_id, EvidenceKind.CLAIM_CONTRADICTED, w(EvidenceKind.CLAIM_CONTRADICTED), claim.timestamp,
                                               f"{speaker} lied about seeing me in {claim.room.value}",
@@ -627,8 +644,10 @@ class ClaimLedger:
                                           f"{speaker} accused {names.get(claim.target_id)} who is confirmed crew",
                                           f"acccrew:{claim.meeting_index}:{claim.speaker_id}:{claim.target_id}"))
                 else:
-                    found.append(Evidence(claim.target_id, EvidenceKind.ACCUSED, w(EvidenceKind.ACCUSED, 1.0 - probs.get(claim.speaker_id, 0.5)), claim.timestamp,
-                                          f"accused by {speaker}",
+                    trust = 1.0 - probs.get(claim.speaker_id, 0.5)
+                    scale = trust * (self.eyewitness_scale if claim.eyewitness else 1.0)
+                    found.append(Evidence(claim.target_id, EvidenceKind.ACCUSED, w(EvidenceKind.ACCUSED, scale), claim.timestamp,
+                                          f"{speaker} claims to have seen it" if claim.eyewitness else f"accused by {speaker}",
                                           f"acc:{claim.meeting_index}:{claim.speaker_id}:{claim.target_id}"))
             elif claim.kind is ClaimKind.VOUCH and claim.target_id is not None:
                 target_p = probs.get(claim.target_id, 0.0)
@@ -746,7 +765,7 @@ class DeceptionPlanner:
     def _witnesses_of_me(self, tracker: GameStateTracker, state: GameState, start: float) -> dict[Room, set[int]]:
         """Rooms where living players were near me (they could vouch or contradict)."""
         rooms: dict[Room, set[int]] = defaultdict(set)
-        my_sightings = [s for s in tracker.sightings(state.local_player_id) if s.timestamp >= start]
+        my_sightings = [s for s in tracker.sightings(state.local_player_id) if s.timestamp >= start + 10.0]
         for mine in my_sightings:
             if mine.room is None or mine.room is Room.HALLWAY:
                 continue
@@ -823,6 +842,9 @@ class DeceptionPlanner:
 
     def _adjacent(self, a: Room, b: Room) -> bool:
         rooms = self.pathfinder.definition.rooms
+        if a not in rooms or b not in rooms:
+            # Hallways have no single rectangle; treat them as adjacent to nothing.
+            return False
         ra, rb = rooms[a], rooms[b]
         gap_x = max(0.0, max(ra.x0, rb.x0) - min(ra.x1, rb.x1))
         gap_y = max(0.0, max(ra.y0, rb.y0) - min(ra.y1, rb.y1))
@@ -987,6 +1009,7 @@ class DiscussionAgent:
         self.voting = voting_policy or VotingPolicy()
         self.reasoning_budget = reasoning_budget
         self.own_statements: list[Statement] = []
+        self._meeting_statements_from = 0
         self.transcript: list[Statement] = []
         self.context: MeetingContext | None = None
         self.plan: DeceptionPlan | None = None
@@ -1008,6 +1031,7 @@ class DiscussionAgent:
         self.observe_tick(state, tracker)
         self.context = context
         self.transcript = []
+        self._meeting_statements_from = len(self.own_statements)
         self._accusers_of_me = set()
         self.ledger.new_meeting()
         self.perception.decay()
@@ -1110,8 +1134,22 @@ class DiscussionAgent:
                 logger.warning("statement generation failed for %s: %s", state.me.name, exc)
         if statement is None:
             statement = self._fallback_statement()
+            if any(statement.text == earlier.text for earlier in self.own_statements[self._meeting_statements_from :]):
+                statement = self._follow_up(statement)
         self.own_statements.append(statement)
         return statement
+
+    def _follow_up(self, repeated: Statement) -> Statement:
+        """Short second-round message instead of repeating the opening statement verbatim."""
+        assert self.state is not None
+        names = self._names()
+        if repeated.accuse_id is not None:
+            text = f"Still voting {names[repeated.accuse_id]}, don't split the votes."
+        elif repeated.vouch_id is not None:
+            text = f"{names[repeated.vouch_id]} is clear, look at someone else."
+        else:
+            text = "Nothing new from me. Skip unless someone has proof."
+        return Statement(self.player_id, text, self.state.timestamp, repeated.accuse_id, repeated.vouch_id, repeated.claimed_room)
 
     def _fallback_statement(self) -> Statement:
         assert self.state is not None and self.context is not None
@@ -1128,7 +1166,10 @@ class DiscussionAgent:
                 return Statement(self.player_id, text, state.timestamp, claimed_room=cover.room)
             return Statement(self.player_id, f"{cover.describe(names)}. Didn't see anything.", state.timestamp, claimed_room=cover.room)
         ranked = self.model.ranked(state)
-        decisive = [e for e in self.model.evidence if e.kind in (EvidenceKind.KILL_WITNESSED, EvidenceKind.VENT_WITNESSED)]
+        decisive = [
+            e for e in self.model.evidence
+            if e.kind in (EvidenceKind.KILL_WITNESSED, EvidenceKind.VENT_WITNESSED) and state.players[e.subject_id].alive
+        ]
         where = self._truthful_cover()
         if decisive:
             e = decisive[-1]
@@ -1138,7 +1179,7 @@ class DiscussionAgent:
             top_note = sorted(self.model.evidence_for(pid), key=lambda x: abs(x.weight), reverse=True)
             reason = top_note[0].note if top_note else "their story doesn't add up"
             return Statement(self.player_id, f"{where}. {names[pid]} is sus: {reason}.", state.timestamp, accuse_id=pid)
-        cleared = [e.subject_id for e in self.model.evidence if e.kind is EvidenceKind.VISUAL_TASK]
+        cleared = [e.subject_id for e in self.model.evidence if e.kind is EvidenceKind.VISUAL_TASK and state.players[e.subject_id].alive]
         if cleared:
             pid = cleared[-1]
             return Statement(self.player_id, f"{where}. {names[pid]} is clear, I saw their visual task.", state.timestamp, vouch_id=pid)
@@ -1222,7 +1263,10 @@ class DiscussionAgent:
             return proposed
         if self.model.known_role(target) is Role.CREWMATE:
             return baseline
-        decisive = {e.subject_id for e in self.model.evidence if e.kind in (EvidenceKind.KILL_WITNESSED, EvidenceKind.VENT_WITNESSED)}
+        decisive = {
+            e.subject_id for e in self.model.evidence
+            if e.kind in (EvidenceKind.KILL_WITNESSED, EvidenceKind.VENT_WITNESSED) and state.players[e.subject_id].alive
+        }
         if decisive and target not in decisive:
             return baseline
         probs = self.model.probabilities(state)

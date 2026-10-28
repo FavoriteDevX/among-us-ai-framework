@@ -480,6 +480,8 @@ class Pathfinder:
         self.obstacles = DynamicObstacles()
         self.vent_cost = vent_cost
         self.max_expansions = max_expansions
+        self._field_cache: dict[Cell, dict[Cell, float]] = {}
+        self._field_cache_size = 256
         self._vent_adjacency: dict[Cell, list[tuple[Cell, str]]] = {}
         for name, vent in self.grid.definition.vents.items():
             here = self.grid.vent_cells[name]
@@ -729,6 +731,41 @@ class Pathfinder:
                         dist[target] = nd
                         heapq.heappush(heap, (nd, target))
         return {cell: value * self.grid.cell_size for cell, value in dist.items() if value <= limit}
+
+    def static_distance(self, start: Vec2, goal: Vec2) -> float:
+        """Walking distance on the static map (no doors, obstacles or vents), cached per goal cell.
+
+        Intended for frequent ranking queries such as "which task is closest";
+        use :meth:`find_path` when the exact current route matters.
+        """
+        goal_cell = self.grid.nearest_walkable(goal)
+        field_ = self._field_cache.get(goal_cell)
+        if field_ is None:
+            saved_blocked, saved_fields = self.obstacles._blocked, self.obstacles._fields
+            self.obstacles._blocked, self.obstacles._fields = {}, {}
+            try:
+                field_ = self.distance_field(self.grid.cell_center(goal_cell))
+            finally:
+                self.obstacles._blocked, self.obstacles._fields = saved_blocked, saved_fields
+            if len(self._field_cache) >= self._field_cache_size:
+                self._field_cache.pop(next(iter(self._field_cache)))
+            self._field_cache[goal_cell] = field_
+        return field_.get(self.grid.nearest_walkable(start), math.inf)
+
+    def has_line_of_sight(self, a: Vec2, b: Vec2, closed_doors: Iterable[Room] = ()) -> bool:
+        """True when the straight segment between two points crosses only walkable, open cells."""
+        door_block = self._closed_door_cells(closed_doors)
+        start, end = self.grid.world_to_cell(a), self.grid.world_to_cell(b)
+        if not self.grid.is_walkable(start) or not self.grid.is_walkable(end):
+            return False
+        door_block.discard(start)
+        door_block.discard(end)
+        saved = self.obstacles._blocked
+        self.obstacles._blocked = {}
+        try:
+            return self._line_of_sight(start, end, door_block)
+        finally:
+            self.obstacles._blocked = saved
 
     def travel_distance(self, start: Vec2, goal: Vec2, **kwargs: object) -> float:
         return self.find_path(start, goal, **kwargs).distance  # type: ignore[arg-type]
